@@ -1,6 +1,7 @@
 ---
 name: autoresearch-create
-description: Set up an autonomous experiment loop for any optimization target. First interviews the user until intent is clear, then drafts a programmatic acceptance boundary, waits for explicit user confirmation, and only then starts experiments. Use when asked to "run autoresearch", "optimize X in a loop", "set up autoresearch for X", or "start experiments".
+description: Set up an autonomous experiment loop for any optimization target. First interviews the user until intent is clear, then drafts a programmatic acceptance boundary, waits for explicit user confirmation, and only then starts experiments. Use when explicitly invoked with `/skill:autoresearch-create`.
+disable-model-invocation: true
 ---
 
 # Autoresearch
