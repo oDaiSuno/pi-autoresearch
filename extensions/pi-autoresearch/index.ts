@@ -2876,7 +2876,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           runtime.autoresearchMode = false;
           runtime.acceptance.phase = "stopped";
           persistAcceptanceState(ctx);
-          ctx.abort();
+          cancelPendingResume(runtime);
         } else if (params.status === "keep") {
           const reason = acceptanceResult.timedOut
             ? "timed out"
@@ -2898,7 +2898,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (limitReached) {
         text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
         runtime.autoresearchMode = false;
-        ctx.abort();
+        cancelPendingResume(runtime);
       } else if (!acceptancePassed && runtime.autoresearchMode && acceptanceIsConfirmed(runtime)) {
         const beforeSteer = await fireHook({
           event: "before",
