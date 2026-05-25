@@ -30,7 +30,7 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 
 import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 
 import {
@@ -138,6 +138,20 @@ interface LogDetails {
   wallClockSeconds: number | null;
 }
 
+type AcceptancePhase =
+  | "none"
+  | "interviewing"
+  | "drafting_acceptance"
+  | "awaiting_confirmation"
+  | "confirmed"
+  | "stopped";
+
+interface AcceptanceState {
+  phase: AcceptancePhase;
+  confirmedFingerprint: string | null;
+  confirmedAt: number | null;
+}
+
 interface AutoresearchRuntime {
   autoresearchMode: boolean;
   dashboardExpanded: boolean;
@@ -145,8 +159,10 @@ interface AutoresearchRuntime {
   autoResumeTurns: number;
   lastRunChecks: { pass: boolean; output: string; duration: number } | null;
   lastRunDuration: number | null;
+  lastRunParsedMetrics: Record<string, number> | null;
   runningExperiment: { startedAt: number; command: string } | null;
   state: ExperimentState;
+  acceptance: AcceptanceState;
   /** Pending auto-resume timer; cancelled when the agent starts a new run or compacts. */
   pendingResumeTimer: ReturnType<typeof setTimeout> | null;
   /** Resume message to send when the pending timer fires. */
@@ -511,7 +527,65 @@ const autoresearchMdPath     = (dir: string) => path.join(dir, "autoresearch.md"
 const autoresearchIdeasPath  = (dir: string) => path.join(dir, "autoresearch.ideas.md");
 const autoresearchChecksPath = (dir: string) => path.join(dir, "autoresearch.checks.sh");
 const autoresearchScriptPath = (dir: string) => path.join(dir, "autoresearch.sh");
+const autoresearchAcceptancePath = (dir: string) => path.join(dir, "autoresearch.acceptance.sh");
 const autoresearchConfigPath = (dir: string) => path.join(dir, "autoresearch.config.json");
+
+interface AcceptanceFileRef {
+  label: string;
+  path: string;
+  required: boolean;
+}
+
+function acceptanceFiles(ctxCwd: string): AcceptanceFileRef[] {
+  const workDir = resolveWorkDir(ctxCwd);
+  return [
+    { label: "autoresearch.sh", path: autoresearchScriptPath(workDir), required: true },
+    { label: "autoresearch.checks.sh", path: autoresearchChecksPath(workDir), required: false },
+    { label: "autoresearch.acceptance.sh", path: autoresearchAcceptancePath(workDir), required: true },
+    { label: "autoresearch.config.json", path: autoresearchConfigPath(ctxCwd), required: false },
+  ];
+}
+
+function acceptanceFingerprint(ctxCwd: string): string {
+  const hash = createHash("sha256");
+  for (const file of acceptanceFiles(ctxCwd)) {
+    hash.update(`${file.label}\0${path.resolve(file.path)}\0`);
+    try {
+      const stat = fs.statSync(file.path);
+      if (!stat.isFile()) {
+        hash.update("not-file\0");
+        continue;
+      }
+      hash.update(fs.readFileSync(file.path));
+      hash.update(`\0mode:${stat.mode & 0o777}\0`);
+    } catch {
+      hash.update("missing\0");
+    }
+  }
+  return hash.digest("hex").slice(0, 8);
+}
+
+function missingRequiredAcceptanceFiles(ctxCwd: string): AcceptanceFileRef[] {
+  return acceptanceFiles(ctxCwd).filter((file) => {
+    if (!file.required) return false;
+    try {
+      return !fs.statSync(file.path).isFile();
+    } catch {
+      return true;
+    }
+  });
+}
+
+function isAcceptanceFilePath(ctxCwd: string, candidate: string): boolean {
+  const resolved = path.resolve(ctxCwd, candidate);
+  return acceptanceFiles(ctxCwd).some((file) => path.resolve(file.path) === resolved);
+}
+
+function acceptanceFilesSummary(ctxCwd: string): string {
+  return acceptanceFiles(ctxCwd)
+    .map((file) => `- ${file.label}: ${file.path}${file.required ? " (required)" : " (optional)"}`)
+    .join("\n");
+}
 
 function findBaselineRunNumber(results: ExperimentResult[], segment: number): number | null {
   const index = results.findIndex((result) => result.segment === segment);
@@ -630,6 +704,14 @@ function createExperimentState(): ExperimentState {
   };
 }
 
+function createAcceptanceState(): AcceptanceState {
+  return {
+    phase: "none",
+    confirmedFingerprint: null,
+    confirmedAt: null,
+  };
+}
+
 function createSessionRuntime(): AutoresearchRuntime {
   return {
     autoresearchMode: false,
@@ -638,8 +720,10 @@ function createSessionRuntime(): AutoresearchRuntime {
     autoResumeTurns: 0,
     lastRunChecks: null,
     lastRunDuration: null,
+    lastRunParsedMetrics: null,
     runningExperiment: null,
     state: createExperimentState(),
+    acceptance: createAcceptanceState(),
     pendingResumeTimer: null,
     pendingResumeMessage: null,
   };
@@ -1007,6 +1091,134 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const getRuntime = (ctx: ExtensionContext): AutoresearchRuntime =>
     runtimeStore.ensure(getSessionKey(ctx));
 
+  const ACCEPTANCE_STATE_CUSTOM_TYPE = "autoresearch-acceptance-state";
+
+  const acceptanceIsConfirmed = (runtime: AutoresearchRuntime): boolean =>
+    runtime.acceptance.phase === "confirmed" && !!runtime.acceptance.confirmedFingerprint;
+
+  const acceptancePhaseLabel = (phase: AcceptancePhase): string => {
+    switch (phase) {
+      case "interviewing": return "interviewing";
+      case "drafting_acceptance": return "drafting acceptance";
+      case "awaiting_confirmation": return "awaiting acceptance confirmation";
+      case "confirmed": return "acceptance confirmed";
+      case "stopped": return "acceptance met";
+      default: return "not started";
+    }
+  };
+
+  const acceptanceStateFromData = (data: unknown): AcceptanceState => {
+    const out = createAcceptanceState();
+    if (!data || typeof data !== "object" || Array.isArray(data)) return out;
+    const record = data as Record<string, unknown>;
+    const phase = record.phase;
+    if (
+      phase === "none" ||
+      phase === "interviewing" ||
+      phase === "drafting_acceptance" ||
+      phase === "awaiting_confirmation" ||
+      phase === "confirmed" ||
+      phase === "stopped"
+    ) {
+      out.phase = phase;
+    }
+    if (typeof record.confirmedFingerprint === "string") {
+      out.confirmedFingerprint = record.confirmedFingerprint;
+    }
+    if (typeof record.confirmedAt === "number") {
+      out.confirmedAt = record.confirmedAt;
+    }
+    return out;
+  };
+
+  const restoreAcceptanceState = (ctx: ExtensionContext, runtime: AutoresearchRuntime): void => {
+    runtime.acceptance = createAcceptanceState();
+    for (const entry of ctx.sessionManager.getBranch()) {
+      const custom = entry as unknown as { type?: string; customType?: string; data?: unknown };
+      if (custom.type !== "custom" || custom.customType !== ACCEPTANCE_STATE_CUSTOM_TYPE) continue;
+      runtime.acceptance = acceptanceStateFromData(custom.data);
+    }
+  };
+
+  const persistAcceptanceState = (ctx: ExtensionContext): void => {
+    const acceptance = getRuntime(ctx).acceptance;
+    pi.appendEntry(ACCEPTANCE_STATE_CUSTOM_TYPE, {
+      phase: acceptance.phase,
+      confirmedFingerprint: acceptance.confirmedFingerprint,
+      confirmedAt: acceptance.confirmedAt,
+    });
+  };
+
+  const setAcceptanceState = (ctx: ExtensionContext, next: Partial<AcceptanceState> & { phase: AcceptancePhase }): void => {
+    const runtime = getRuntime(ctx);
+    runtime.acceptance = {
+      ...runtime.acceptance,
+      ...next,
+    };
+    persistAcceptanceState(ctx);
+    updateWidget(ctx);
+  };
+
+  const clearAcceptanceState = (ctx: ExtensionContext): void => {
+    const runtime = getRuntime(ctx);
+    runtime.acceptance = createAcceptanceState();
+    persistAcceptanceState(ctx);
+  };
+
+  const invalidateAcceptanceConfirmation = (ctx: ExtensionContext, reason: string): void => {
+    const runtime = getRuntime(ctx);
+    if (runtime.acceptance.phase !== "confirmed") return;
+    runtime.acceptance = {
+      phase: "awaiting_confirmation",
+      confirmedFingerprint: null,
+      confirmedAt: null,
+    };
+    persistAcceptanceState(ctx);
+    if (ctx.hasUI) ctx.ui.notify(`Acceptance confirmation reset: ${reason}`, "info");
+  };
+
+  const acceptanceGateMessage = (ctx: ExtensionContext, toolName: string): string | null => {
+    const runtime = getRuntime(ctx);
+    if (!acceptanceIsConfirmed(runtime)) {
+      return [
+        `❌ ${toolName} blocked: the acceptance program has not been explicitly confirmed by the user.`,
+        "",
+        `Current phase: ${acceptancePhaseLabel(runtime.acceptance.phase)}.`,
+        "First complete the soft interview, then ask the user to run `/autoresearch draft-acceptance`.",
+        "After drafting the acceptance program, show it with `/autoresearch acceptance` and require `/autoresearch accept <fingerprint>` before experiments can start.",
+      ].join("\n");
+    }
+
+    const missing = missingRequiredAcceptanceFiles(ctx.cwd);
+    if (missing.length > 0) {
+      invalidateAcceptanceConfirmation(ctx, "required acceptance files are missing");
+      return [
+        `❌ ${toolName} blocked: required acceptance files are missing.`,
+        "",
+        ...missing.map((file) => `- ${file.label}: ${file.path}`),
+        "",
+        "Draft the acceptance program again, then require explicit user confirmation.",
+      ].join("\n");
+    }
+
+    const currentFingerprint = acceptanceFingerprint(ctx.cwd);
+    if (currentFingerprint !== runtime.acceptance.confirmedFingerprint) {
+      const previousFingerprint = runtime.acceptance.confirmedFingerprint;
+      invalidateAcceptanceConfirmation(ctx, "acceptance files changed after confirmation");
+      return [
+        `❌ ${toolName} blocked: acceptance files changed after user confirmation.`,
+        "",
+        `Confirmed fingerprint: ${previousFingerprint}`,
+        `Current fingerprint:   ${currentFingerprint}`,
+        "",
+        "The user must review the changed acceptance program and run:",
+        `  /autoresearch accept ${currentFingerprint}`,
+      ].join("\n");
+    }
+
+    return null;
+  };
+
   const isAgentSettled = (ctx: ExtensionContext): boolean =>
     ctx.isIdle() && !ctx.hasPendingMessages();
 
@@ -1068,10 +1280,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // Why the experiment gate: a chat-only turn would otherwise loop forever,
   // because every agent_end would re-prompt the agent, which would chat again.
   const shouldAutoResumeAfterTurn = (runtime: AutoresearchRuntime): boolean =>
-    runtime.autoresearchMode && hasRunExperimentsThisSession(runtime);
+    runtime.autoresearchMode && acceptanceIsConfirmed(runtime) && hasRunExperimentsThisSession(runtime);
 
   const shouldAutoResumeAfterCompact = (runtime: AutoresearchRuntime): boolean =>
-    runtime.autoresearchMode;
+    runtime.autoresearchMode && acceptanceIsConfirmed(runtime);
 
   const hasReachedAutoResumeLimit = (runtime: AutoresearchRuntime): boolean =>
     runtime.autoResumeTurns >= MAX_AUTORESUME_TURNS;
@@ -1160,6 +1372,68 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return steerMessageFor(payload.event, result);
   };
 
+  const runAcceptanceProgram = async (
+    ctx: ExtensionContext,
+    payload: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<{ passed: boolean; exitCode: number | null; timedOut: boolean; output: string; durationSeconds: number }> => {
+    const workDir = resolveWorkDir(ctx.cwd);
+    const script = autoresearchAcceptancePath(workDir);
+    const t0 = Date.now();
+
+    return new Promise((resolve) => {
+      let timedOut = false;
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+
+      const child = spawn("bash", [script], {
+        cwd: workDir,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+
+      const finish = (exitCode: number | null) => {
+        if (settled) return;
+        settled = true;
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+        if (signal) signal.removeEventListener("abort", onAbort);
+        const output = (stdout + (stderr ? `\n${stderr}` : "")).trim();
+        resolve({
+          passed: exitCode === 0 && !timedOut,
+          exitCode,
+          timedOut,
+          output: output.split("\n").slice(-80).join("\n"),
+          durationSeconds: (Date.now() - t0) / 1000,
+        });
+      };
+
+      const onAbort = () => {
+        if (child.pid) killTree(child.pid);
+        else child.kill();
+      };
+
+      const timeoutHandle = setTimeout(() => {
+        timedOut = true;
+        if (child.pid) killTree(child.pid);
+        else child.kill();
+      }, 30_000);
+
+      if (signal) {
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
+      child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+      child.on("error", (err) => {
+        stderr += stderr ? `\n${err.message}` : err.message;
+        finish(null);
+      });
+      child.on("close", (code) => finish(code));
+      child.stdin?.end(JSON.stringify(payload));
+    });
+  };
+
   // Running experiment state (for spinner in fullscreen overlay)
   let overlayTui: { requestRender: () => void } | null = null;
   let spinnerInterval: ReturnType<typeof setInterval> | null = null;
@@ -1183,17 +1457,23 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const autoresearchHelp = () =>
     [
-      "Usage: /autoresearch [off|clear|export|<text>]",
+      "Usage: /autoresearch [interview <goal>|draft-acceptance|acceptance|accept <fingerprint>|reset-acceptance|off|clear|export|<goal>]",
       "",
-      "<text> enters autoresearch mode and starts or resumes the loop.",
+      "<goal> or interview <goal> starts acceptance-interview mode. The agent asks one question at a time, recommends answers, and inspects code when possible.",
+      "draft-acceptance lets the agent draft autoresearch.sh, autoresearch.acceptance.sh, and related acceptance files.",
+      "acceptance shows the current acceptance files and fingerprint.",
+      "accept <fingerprint> explicitly confirms the acceptance program and unlocks experiments.",
+      "reset-acceptance clears confirmation and returns to interview mode.",
       "off leaves autoresearch mode.",
-      "clear deletes autoresearch.jsonl and turns autoresearch mode off.",
+      "clear deletes autoresearch.jsonl, resets acceptance state, and turns autoresearch mode off.",
       "export opens a local live dashboard for autoresearch.jsonl in your browser.",
 
       "",
       "Examples:",
       "  /autoresearch optimize unit test runtime, monitor correctness",
-      "  /autoresearch model training, run 5 minutes of train.py and note the loss ratio as optimization target",
+      "  /autoresearch draft-acceptance",
+      "  /autoresearch acceptance",
+      "  /autoresearch accept 4f2a9c1b",
       "  /autoresearch export",
     ].join("\n");
 
@@ -1206,10 +1486,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     cancelPendingResume(runtime);
     runtime.lastRunChecks = null;
     runtime.lastRunDuration = null;
+    runtime.lastRunParsedMetrics = null;
     runtime.runningExperiment = null;
     runtime.experimentsThisSession = 0;
     runtime.autoResumeTurns = 0;
     runtime.state = createExperimentState();
+    restoreAcceptanceState(ctx, runtime);
 
     let state = runtime.state;
 
@@ -1275,6 +1557,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     // Auto-enter autoresearch mode only when a persisted experiment log exists
     runtime.autoresearchMode = fs.existsSync(autoresearchJsonlPath(workDir));
+    if (runtime.autoresearchMode && runtime.acceptance.phase === "none") {
+      runtime.acceptance.phase = "awaiting_confirmation";
+    }
 
     updateWidget(ctx);
   };
@@ -1287,7 +1572,32 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     if (state.results.length === 0) {
       if (!runtime.runningExperiment) {
-        ctx.ui.setWidget("autoresearch", undefined);
+        if (!runtime.autoresearchMode || runtime.acceptance.phase === "none") {
+          ctx.ui.setWidget("autoresearch", undefined);
+          return;
+        }
+
+        ctx.ui.setWidget("autoresearch", (tui, theme) => ({
+          render(width: number): string[] {
+            const safeWidth = Math.max(1, width || getTuiSize(tui).width);
+            const phase = acceptancePhaseLabel(runtime.acceptance.phase);
+            const fp = runtime.acceptance.confirmedFingerprint
+              ? theme.fg("dim", ` │ fp ${runtime.acceptance.confirmedFingerprint}`)
+              : "";
+            return [
+              joinPartsToWidth(
+                [
+                  theme.fg("accent", "🔬"),
+                  theme.fg("warning", ` ${phase}`),
+                  fp,
+                  theme.fg("dim", " │ experiments locked until acceptance is confirmed"),
+                ],
+                safeWidth
+              ),
+            ];
+          },
+          invalidate(): void {},
+        }));
         return;
       }
 
@@ -1492,6 +1802,43 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     ensurePendingResume(ctx, shouldAutoResumeAfterTurn);
   });
 
+  pi.on("tool_call", async (event, ctx) => {
+    const runtime = getRuntime(ctx);
+    if (!runtime.autoresearchMode) return;
+
+    const input = event.input as Record<string, unknown> | undefined;
+    const inputPath = typeof input?.path === "string" ? input.path : "";
+
+    if ((event.toolName === "write" || event.toolName === "edit") && inputPath && isAcceptanceFilePath(ctx.cwd, inputPath)) {
+      if (runtime.acceptance.phase === "interviewing") {
+        return {
+          block: true,
+          reason:
+            "Acceptance files are locked during the interview phase. Continue clarifying user intent; the user must run /autoresearch draft-acceptance before these files can be written.",
+        };
+      }
+      invalidateAcceptanceConfirmation(ctx, `${event.toolName} touched ${inputPath}`);
+    }
+
+    if (event.toolName === "bash" && runtime.acceptance.phase === "interviewing") {
+      const command = typeof input?.command === "string" ? input.command : "";
+      const mentionsAcceptanceFile = [
+        "autoresearch.sh",
+        "autoresearch.checks.sh",
+        "autoresearch.acceptance.sh",
+        "autoresearch.config.json",
+      ].some((name) => command.includes(name));
+      const looksLikeWrite = /(>|\btee\b|\btouch\b|\bchmod\b|\bmv\b|\bcp\b|\brm\b)/.test(command);
+      if (mentionsAcceptanceFile && looksLikeWrite) {
+        return {
+          block: true,
+          reason:
+            "Acceptance files are locked during the interview phase. The user must run /autoresearch draft-acceptance before drafting or changing acceptance artifacts.",
+        };
+      }
+    }
+  });
+
   // When in autoresearch mode, add a static note to the system prompt.
   // Only a short pointer — no file content, fully cache-safe.
   pi.on("before_agent_start", async (event, ctx) => {
@@ -1505,13 +1852,60 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     const checksPath = autoresearchChecksPath(workDir);
     const hasChecks = fs.existsSync(checksPath);
+    const phase = runtime.acceptance.phase;
+
+    if (phase === "interviewing") {
+      return {
+        systemPrompt: event.systemPrompt +
+          "\n\n## Autoresearch Acceptance Interview Mode" +
+          "\nYou are in the user-intent interview phase. Your only goal is to reach shared understanding before any acceptance-boundary program is drafted." +
+          "\nAsk exactly one important question at a time. For each question, provide your recommended answer and explain why." +
+          "\nDo not follow a fixed checklist mechanically. Let the user's answers and the codebase shape the next question." +
+          "\nIf a question can be answered by inspecting the codebase, inspect the codebase instead of asking the user." +
+          "\nDo not write autoresearch.sh, autoresearch.checks.sh, autoresearch.acceptance.sh, or autoresearch.config.json in this phase." +
+          "\nDo not call init_experiment, run_experiment, or log_experiment." +
+          "\nWhen the user believes the intent is clear enough, they must explicitly run `/autoresearch draft-acceptance`. Until then, keep interviewing naturally.",
+      };
+    }
+
+    if (phase === "drafting_acceptance") {
+      return {
+        systemPrompt: event.systemPrompt +
+          "\n\n## Autoresearch Acceptance Drafting Mode" +
+          "\nThe user has authorized drafting the programmatic acceptance boundary. Draft the minimum acceptance artifacts needed for automated stopping." +
+          "\nYou may write autoresearch.md, autoresearch.sh, autoresearch.checks.sh, autoresearch.acceptance.sh, and autoresearch.config.json." +
+          "\nThe acceptance program should be executable and should decide whether the latest logged run satisfies the user's agreed quantitative boundary." +
+          "\nDo not call init_experiment, run_experiment, or log_experiment yet." +
+          "\nAfter drafting, ask the user to review `/autoresearch acceptance`, then confirm with `/autoresearch accept <fingerprint>`.",
+      };
+    }
+
+    if (phase === "awaiting_confirmation" || phase === "none") {
+      return {
+        systemPrompt: event.systemPrompt +
+          "\n\n## Autoresearch Acceptance Confirmation Required" +
+          "\nExperiments are locked until the user explicitly confirms the acceptance program." +
+          "\nDo not call init_experiment, run_experiment, or log_experiment." +
+          "\nAsk the user to review `/autoresearch acceptance` and confirm with `/autoresearch accept <fingerprint>` if the program reflects their intent." +
+          "\nIf the acceptance program is not ready, ask the user to run `/autoresearch draft-acceptance` or continue the interview.",
+      };
+    }
+
+    if (phase === "stopped") {
+      return {
+        systemPrompt: event.systemPrompt +
+          "\n\n## Autoresearch Acceptance Met" +
+          "\nThe acceptance program has already passed and autoresearch is stopped. Do not resume experiments unless the user explicitly starts a new interview or resets acceptance.",
+      };
+    }
 
     let extra =
       "\n\n## Autoresearch Mode (ACTIVE)" +
-      "\nYou are in autoresearch mode. Optimize the primary metric through an autonomous experiment loop." +
-      "\nUse init_experiment, run_experiment, and log_experiment tools. NEVER STOP until interrupted." +
+      "\nAcceptance program confirmed. Optimize the primary metric through an autonomous experiment loop until the acceptance program passes or another stop condition is reached." +
+      "\nUse init_experiment, run_experiment, and log_experiment tools. NEVER STOP until interrupted or until the acceptance program passes." +
       `\nExperiment rules: ${mdPath} — read this file at the start of every session and after compaction.` +
       "\nWrite promising but deferred optimizations as bullet points to autoresearch.ideas.md — don't let good ideas get lost." +
+      `\nConfirmed acceptance fingerprint: ${runtime.acceptance.confirmedFingerprint}.` +
       `\n${BENCHMARK_GUARDRAIL}` +
       "\nIf the user sends a follow-on message while an experiment is running, finish the current run_experiment + log_experiment cycle first, then address their message in the next iteration.";
 
@@ -1561,6 +1955,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (workDirError) {
         return {
           content: [{ type: "text", text: `❌ ${workDirError}` }],
+          details: {},
+        };
+      }
+
+      const gateMessage = acceptanceGateMessage(ctx, "init_experiment");
+      if (gateMessage) {
+        return {
+          content: [{ type: "text", text: gateMessage }],
           details: {},
         };
       }
@@ -1683,6 +2085,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
       const workDir = resolveWorkDir(ctx.cwd);
+
+      const gateMessage = acceptanceGateMessage(ctx, "run_experiment");
+      if (gateMessage) {
+        return {
+          content: [{ type: "text", text: gateMessage }],
+          details: {},
+        };
+      }
+      runtime.lastRunParsedMetrics = null;
 
       // Block if max experiments limit already reached
       if (state.maxExperiments !== null) {
@@ -1954,6 +2365,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         ? Object.fromEntries(parsedMetricMap)
         : null;
       const parsedPrimary = parsedMetricMap.get(state.metricName) ?? null;
+      runtime.lastRunParsedMetrics = parsedMetrics;
 
       const details: RunDetails = {
         command: params.command,
@@ -2187,7 +2599,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     ],
     parameters: LogParams,
 
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const runtime = getRuntime(ctx);
       const state = runtime.state;
 
@@ -2201,6 +2613,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
       const workDir = resolveWorkDir(ctx.cwd);
       const secondaryMetrics = params.metrics ?? {};
+
+      const gateMessage = acceptanceGateMessage(ctx, "log_experiment");
+      if (gateMessage) {
+        return {
+          content: [{ type: "text", text: gateMessage }],
+          details: {},
+        };
+      }
 
       // Gate: prevent "keep" when last run's checks failed
       if (params.status === "keep" && runtime.lastRunChecks && !runtime.lastRunChecks.pass) {
@@ -2428,17 +2848,58 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       });
       if (afterSteer) pi.sendUserMessage(afterSteer, { deliverAs: "steer" });
 
+      let acceptancePassed = false;
+      if (acceptanceIsConfirmed(runtime)) {
+        const baselineMetrics = findBaselineSecondary(state.results, state.currentSegment, state.secondaryMetrics);
+        if (state.bestMetric !== null) baselineMetrics[state.metricName] = state.bestMetric;
+        const metricsForAcceptance: Record<string, number> = {
+          ...(runtime.lastRunParsedMetrics ?? {}),
+          [state.metricName]: params.metric,
+          ...secondaryMetrics,
+        };
+        const acceptancePayload = {
+          run: state.results.length,
+          status: params.status,
+          metric: params.metric,
+          metrics: metricsForAcceptance,
+          checks_pass: runtime.lastRunChecks?.pass ?? null,
+          confidence: state.confidence,
+          baseline_metric: state.bestMetric,
+          baseline_metrics: baselineMetrics,
+          description: params.description,
+          asi: mergedASI ?? null,
+        };
+        const acceptanceResult = await runAcceptanceProgram(ctx, acceptancePayload, signal);
+        if (acceptanceResult.passed) {
+          acceptancePassed = true;
+          text += `\n\n🎯 Acceptance program passed in ${acceptanceResult.durationSeconds.toFixed(1)}s. Stopping autoresearch.`;
+          runtime.autoresearchMode = false;
+          runtime.acceptance.phase = "stopped";
+          persistAcceptanceState(ctx);
+          ctx.abort();
+        } else if (params.status === "keep") {
+          const reason = acceptanceResult.timedOut
+            ? "timed out"
+            : `exit ${acceptanceResult.exitCode ?? "unknown"}`;
+          text += `\n🎯 Acceptance program not met (${reason}).`;
+          if (acceptanceResult.output) {
+            text += `\n${acceptanceResult.output.slice(-500)}`;
+          }
+        }
+      }
+
       const wallClockSeconds = runtime.lastRunDuration;
       runtime.runningExperiment = null;
       runtime.lastRunChecks = null;
       runtime.lastRunDuration = null;
+      runtime.lastRunParsedMetrics = null;
 
-      const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
+      const limitReached = !acceptancePassed && state.maxExperiments !== null && segmentCount >= state.maxExperiments;
       if (limitReached) {
         text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
         runtime.autoresearchMode = false;
         ctx.abort();
-      } else if (runtime.autoresearchMode) {
+      } else if (!acceptancePassed && runtime.autoresearchMode && acceptanceIsConfirmed(runtime)) {
         const beforeSteer = await fireHook({
           event: "before",
           cwd: workDir,
@@ -2936,11 +3397,60 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // -----------------------------------------------------------------------
 
   pi.registerCommand("autoresearch", {
-    description: "Start, stop, clear, or resume autoresearch mode",
+    description: "Interview, confirm acceptance, then start/stop autoresearch mode",
     handler: async (args, ctx) => {
       const runtime = getRuntime(ctx);
       const trimmedArgs = (args ?? "").trim();
       const command = trimmedArgs.toLowerCase();
+      const [subcommandRaw = "", ...rest] = trimmedArgs.split(/\s+/);
+      const subcommand = subcommandRaw.toLowerCase();
+
+      const startInterview = (goal: string) => {
+        runtime.autoresearchMode = true;
+        runtime.dashboardExpanded = false;
+        runtime.autoResumeTurns = 0;
+        runtime.experimentsThisSession = 0;
+        runtime.lastRunChecks = null;
+        runtime.lastRunDuration = null;
+        runtime.lastRunParsedMetrics = null;
+        runtime.runningExperiment = null;
+        cancelPendingResume(runtime);
+        setAcceptanceState(ctx, {
+          phase: "interviewing",
+          confirmedFingerprint: null,
+          confirmedAt: null,
+        });
+        ctx.ui.notify("Autoresearch interview mode ON — experiments are locked until acceptance is confirmed", "info");
+        sendWhenReady(ctx, [
+          `Start an autoresearch acceptance interview for: ${goal}`,
+          "Ask one important question at a time, provide your recommended answer, and explain why.",
+          "Do not use a fixed checklist mechanically; follow the user's answers and inspect the codebase when that can answer a question.",
+          "Do not draft acceptance files or run experiments until the user explicitly runs `/autoresearch draft-acceptance`.",
+          BENCHMARK_GUARDRAIL,
+        ].join("\n"));
+      };
+
+      const showAcceptance = () => {
+        const fingerprint = acceptanceFingerprint(ctx.cwd);
+        const missing = missingRequiredAcceptanceFiles(ctx.cwd);
+        const lines = [
+          "Acceptance program status:",
+          `Phase: ${acceptancePhaseLabel(runtime.acceptance.phase)}`,
+          `Current fingerprint: ${fingerprint}`,
+          runtime.acceptance.confirmedFingerprint
+            ? `Confirmed fingerprint: ${runtime.acceptance.confirmedFingerprint}`
+            : "Confirmed fingerprint: —",
+          "",
+          "Files:",
+          acceptanceFilesSummary(ctx.cwd),
+        ];
+        if (missing.length > 0) {
+          lines.push("", "Missing required files:", ...missing.map((file) => `- ${file.label}: ${file.path}`));
+        } else {
+          lines.push("", "To confirm this exact acceptance program, run:", `  /autoresearch accept ${fingerprint}`);
+        }
+        ctx.ui.notify(lines.join("\n"), missing.length > 0 ? "error" : "info");
+      };
 
       if (!trimmedArgs) {
         ctx.ui.notify(autoresearchHelp(), "info");
@@ -2956,8 +3466,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         runtime.experimentsThisSession = 0;
         runtime.lastRunChecks = null;
         runtime.lastRunDuration = null;
+        runtime.lastRunParsedMetrics = null;
         runtime.runningExperiment = null;
         cancelPendingResume(runtime);
+        clearAcceptanceState(ctx);
         stopDashboardServer();
         clearSessionUi(ctx);
         if (wasRunning) ctx.abort();
@@ -2980,16 +3492,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         runtime.autoResumeTurns = 0;
         runtime.experimentsThisSession = 0;
         runtime.lastRunChecks = null;
+        runtime.lastRunDuration = null;
+        runtime.lastRunParsedMetrics = null;
         runtime.runningExperiment = null;
         cancelPendingResume(runtime);
         runtime.state = createExperimentState();
+        clearAcceptanceState(ctx);
         stopDashboardServer();
         updateWidget(ctx);
 
         if (fs.existsSync(jsonlPath)) {
           try {
             fs.unlinkSync(jsonlPath);
-            ctx.ui.notify("Deleted autoresearch.jsonl and turned autoresearch mode OFF", "info");
+            ctx.ui.notify("Deleted autoresearch.jsonl, reset acceptance state, and turned autoresearch mode OFF", "info");
           } catch (error) {
             ctx.ui.notify(
               `Failed to delete autoresearch.jsonl: ${error instanceof Error ? error.message : String(error)}`,
@@ -2997,42 +3512,115 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             );
           }
         } else {
-          ctx.ui.notify("No autoresearch.jsonl found. Autoresearch mode OFF", "info");
+          ctx.ui.notify("No autoresearch.jsonl found. Acceptance state reset and autoresearch mode OFF", "info");
         }
         return;
       }
 
-      if (runtime.autoresearchMode) {
-        ctx.ui.notify("Autoresearch already active — use '/autoresearch off' to stop first", "info");
+      if (subcommand === "interview") {
+        const goal = rest.join(" ").trim();
+        if (!goal) {
+          ctx.ui.notify("Usage: /autoresearch interview <goal>", "error");
+          return;
+        }
+        startInterview(goal);
         return;
       }
 
-      runtime.autoresearchMode = true;
-      runtime.autoResumeTurns = 0;
+      if (command === "reset-acceptance") {
+        runtime.autoresearchMode = true;
+        runtime.autoResumeTurns = 0;
+        cancelPendingResume(runtime);
+        setAcceptanceState(ctx, {
+          phase: "interviewing",
+          confirmedFingerprint: null,
+          confirmedAt: null,
+        });
+        ctx.ui.notify("Acceptance reset — back to interview mode", "info");
+        return;
+      }
 
-      const workDir = resolveWorkDir(ctx.cwd);
-      const rulesLoaded = hasAutoresearchRules(ctx);
-      const kickoff = rulesLoaded
-        ? `Autoresearch mode active. ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`
-        : `Start autoresearch: ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`;
+      if (command === "draft-acceptance") {
+        runtime.autoresearchMode = true;
+        runtime.autoResumeTurns = 0;
+        cancelPendingResume(runtime);
+        setAcceptanceState(ctx, {
+          phase: "drafting_acceptance",
+          confirmedFingerprint: null,
+          confirmedAt: null,
+        });
+        sendWhenReady(ctx, [
+          "Draft the programmatic autoresearch acceptance boundary now.",
+          "Use the intent established in the interview. Write only the necessary acceptance artifacts, typically autoresearch.md, autoresearch.sh, optional autoresearch.checks.sh, autoresearch.acceptance.sh, and autoresearch.config.json.",
+          "Do not run init_experiment, run_experiment, or log_experiment.",
+          "After drafting, tell the user to run `/autoresearch acceptance` and then `/autoresearch accept <fingerprint>` if they approve.",
+        ].join("\n"));
+        return;
+      }
 
-      ctx.ui.notify(
-        rulesLoaded
-          ? "Autoresearch mode ON — rules loaded from autoresearch.md"
-          : "Autoresearch mode ON — no autoresearch.md found, setting up",
-        "info",
-      );
+      if (command === "acceptance") {
+        if (runtime.acceptance.phase === "drafting_acceptance") {
+          setAcceptanceState(ctx, { phase: "awaiting_confirmation" });
+        }
+        showAcceptance();
+        return;
+      }
 
-      const state = runtime.state;
-      const activationSteer = await fireHook({
-        event: "before",
-        cwd: workDir,
-        next_run: state.results.length + 1,
-        last_run: readLastRun(workDir),
-        session: buildSessionSnapshot(state),
-      });
+      if (subcommand === "accept") {
+        const requestedFingerprint = rest.join(" ").trim();
+        if (!requestedFingerprint) {
+          ctx.ui.notify("Usage: /autoresearch accept <fingerprint>", "error");
+          return;
+        }
+        const missing = missingRequiredAcceptanceFiles(ctx.cwd);
+        if (missing.length > 0) {
+          ctx.ui.notify(
+            [
+              "Cannot confirm acceptance: required files are missing.",
+              ...missing.map((file) => `- ${file.label}: ${file.path}`),
+            ].join("\n"),
+            "error",
+          );
+          return;
+        }
+        const currentFingerprint = acceptanceFingerprint(ctx.cwd);
+        if (requestedFingerprint !== currentFingerprint) {
+          ctx.ui.notify(
+            [
+              "Fingerprint mismatch. Review the current acceptance program before confirming.",
+              `Requested: ${requestedFingerprint}`,
+              `Current:   ${currentFingerprint}`,
+              `Run: /autoresearch accept ${currentFingerprint}`,
+            ].join("\n"),
+            "error",
+          );
+          return;
+        }
 
-      sendWhenReady(ctx, activationSteer ? `${activationSteer}\n\n${kickoff}` : kickoff);
+        runtime.autoresearchMode = true;
+        runtime.autoResumeTurns = 0;
+        cancelPendingResume(runtime);
+        setAcceptanceState(ctx, {
+          phase: "confirmed",
+          confirmedFingerprint: currentFingerprint,
+          confirmedAt: Date.now(),
+        });
+        ctx.ui.notify(`Acceptance confirmed (${currentFingerprint}). Experiments are now unlocked.`, "info");
+        sendWhenReady(ctx, [
+          `Acceptance program confirmed with fingerprint ${currentFingerprint}.`,
+          "Start or resume the autoresearch loop now. If autoresearch.jsonl already has a config header, do not call init_experiment again; otherwise initialize, run the baseline, then continue with run_experiment + log_experiment.",
+          "Stop automatically when autoresearch.acceptance.sh passes.",
+          BENCHMARK_GUARDRAIL,
+        ].join("\n"));
+        return;
+      }
+
+      if (runtime.autoresearchMode && runtime.acceptance.phase !== "stopped") {
+        ctx.ui.notify("Autoresearch already active — use '/autoresearch off' to stop or '/autoresearch reset-acceptance' to restart the interview", "info");
+        return;
+      }
+
+      startInterview(trimmedArgs);
     },
   });
 }

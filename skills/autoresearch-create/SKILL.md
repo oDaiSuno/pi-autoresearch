@@ -1,11 +1,11 @@
 ---
 name: autoresearch-create
-description: Set up and run an autonomous experiment loop for any optimization target. Gathers what to optimize, then starts the loop immediately. Use when asked to "run autoresearch", "optimize X in a loop", "set up autoresearch for X", or "start experiments".
+description: Set up an autonomous experiment loop for any optimization target. First interviews the user until intent is clear, then drafts a programmatic acceptance boundary, waits for explicit user confirmation, and only then starts experiments. Use when asked to "run autoresearch", "optimize X in a loop", "set up autoresearch for X", or "start experiments".
 ---
 
 # Autoresearch
 
-Autonomous experiment loop: try ideas, keep what works, discard what doesn't, never stop.
+Autonomous experiment loop: first establish an explicit programmatic acceptance boundary with the user, then try ideas, keep what works, discard what doesn't, and stop when the accepted boundary passes.
 
 ## Tools
 
@@ -15,11 +15,14 @@ Autonomous experiment loop: try ideas, keep what works, discard what doesn't, ne
 
 ## Setup
 
-1. Ask (or infer): **Goal**, **Command**, **Metric** (+ direction), **Files in scope**, **Constraints**.
-2. `git checkout -b autoresearch/<goal>-<date>`
-3. Read the source files. Understand the workload deeply before writing anything.
-4. Write `autoresearch.md` and `autoresearch.sh` (see below). Commit both.
-5. `init_experiment` → run baseline → `log_experiment` → start looping immediately.
+0. **Interview first.** Before drafting any acceptance files or running any experiment, ask the user one important question at a time until there is shared understanding of the intended outcome. For each question, provide your recommended answer and why. Do not use a fixed checklist mechanically; follow the user's answers and the codebase. If a question can be answered by inspecting the codebase, inspect the codebase instead of asking.
+1. Wait for the user to explicitly run `/autoresearch draft-acceptance`. Until then, do not write `autoresearch.sh`, `autoresearch.checks.sh`, `autoresearch.acceptance.sh`, or `autoresearch.config.json`, and do not call `init_experiment`, `run_experiment`, or `log_experiment`.
+2. After `/autoresearch draft-acceptance`, draft the acceptance artifacts: **Goal**, **Command**, **Metric** (+ direction), **Programmatic acceptance boundary**, **Files in scope**, **Constraints**, and budget.
+3. `git checkout -b autoresearch/<goal>-<date>` when appropriate.
+4. Read the source files. Understand the workload deeply before writing anything.
+5. Write `autoresearch.md`, `autoresearch.sh`, and `autoresearch.acceptance.sh` (see below). Write `autoresearch.checks.sh` only if correctness constraints require it. Commit these setup files if the repository policy allows.
+6. Ask the user to review `/autoresearch acceptance` and confirm the exact fingerprint with `/autoresearch accept <fingerprint>`.
+7. Only after confirmation: `init_experiment` → run baseline → `log_experiment` → start looping.
 
 ### `autoresearch.md`
 
@@ -81,6 +84,50 @@ Use `log_experiment`'s `asi` parameter to annotate each run with **whatever woul
 
 **Annotate failures and crashes heavily.** Discarded and crashed runs are reverted — the code changes are gone. The only record that survives is the description and ASI in `autoresearch.jsonl`. If you don't capture what you tried and why it failed, future iterations will waste time re-discovering the same dead ends.
 
+### `autoresearch.acceptance.sh`
+
+Bash script (`set -euo pipefail`) that receives one JSON object on stdin after every `log_experiment`. Exit `0` when the accepted stop boundary is satisfied; exit non-zero when the loop should continue. It should encode the user's confirmed quantitative acceptance condition, not a vague preference.
+
+Example stdin shape:
+
+```json
+{
+  "run": 3,
+  "status": "keep",
+  "metric": 8.91,
+  "metrics": { "latency_ms": 8.91, "p95_ms": 11.42 },
+  "checks_pass": true,
+  "confidence": 1.8,
+  "baseline_metric": 14.82,
+  "baseline_metrics": { "latency_ms": 14.82, "p95_ms": 12.00 },
+  "description": "Use dict comprehension in hot loop",
+  "asi": { "hypothesis": "reduce Python loop overhead" }
+}
+```
+
+Python-oriented acceptance example:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+payload="$(cat)"
+python - "$payload" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+metrics = payload["metrics"]
+
+if payload["status"] != "keep":
+    sys.exit(1)
+if payload.get("checks_pass") is False:
+    sys.exit(1)
+if metrics["latency_ms"] <= 10.0:
+    sys.exit(0)
+sys.exit(1)
+PY
+```
+
 ### `autoresearch.config.json` (optional)
 
 JSON config file that lives in the pi session's working directory (`ctx.cwd`). Supported fields:
@@ -120,7 +167,7 @@ pnpm typecheck 2>&1 | grep -i error || true
 
 ## Loop Rules
 
-**LOOP FOREVER.** Never ask "should I continue?" — the user expects autonomous work.
+**LOOP UNTIL THE ACCEPTED BOUNDARY PASSES.** Never ask "should I continue?" during the confirmed experiment phase — the user expects autonomous work until `autoresearch.acceptance.sh` exits `0`, `maxIterations` is reached, or the user interrupts.
 
 - **Primary metric is king.** Improved → `keep`. Worse/equal → `discard`. Secondary metrics rarely affect this.
 - **Annotate every run with `asi`.** Record what you learned — not what you did. What would help the next iteration or a fresh agent resuming this session?
@@ -131,7 +178,7 @@ pnpm typecheck 2>&1 | grep -i error || true
 - **Think longer when stuck.** Re-read source files, study the profiling data, reason about what the CPU is actually doing. The best ideas come from deep understanding, not from trying random variations.
 - **Resuming:** if `autoresearch.md` exists, read it + git log, continue looping.
 
-**NEVER STOP.** The user may be away for hours. Keep going until interrupted.
+**STOP ONLY ON ACCEPTANCE, BUDGET, OR INTERRUPTION.** The user may be away for hours. Keep going until `autoresearch.acceptance.sh` passes, `maxIterations` is reached, or the user interrupts.
 
 ## Ideas Backlog
 
