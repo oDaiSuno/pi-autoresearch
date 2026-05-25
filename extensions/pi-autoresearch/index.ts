@@ -1457,14 +1457,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const autoresearchHelp = () =>
     [
-      "Usage: /autoresearch [interview <goal>|draft-acceptance|acceptance|accept <fingerprint>|reset-acceptance|off|clear|export|<goal>]",
+      "Usage: /autoresearch [interview <goal>|draft-acceptance|acceptance|accept <fingerprint>|continue|reset-acceptance|off|clear|export|<goal>]",
       "",
       "<goal> or interview <goal> starts acceptance-interview mode. The agent asks one question at a time, recommends answers, and inspects code when possible.",
       "draft-acceptance lets the agent draft autoresearch.sh, autoresearch.acceptance.sh, and related acceptance files.",
       "acceptance shows the current acceptance files and fingerprint.",
       "accept <fingerprint> explicitly confirms the acceptance program and unlocks experiments.",
+      "continue manually resumes a confirmed autoresearch loop; sessions no longer auto-resume just because autoresearch.jsonl exists.",
       "reset-acceptance clears confirmation and returns to interview mode.",
-      "off leaves autoresearch mode.",
+      "off leaves autoresearch mode without clearing the confirmed acceptance program.",
       "clear deletes autoresearch.jsonl, resets acceptance state, and turns autoresearch mode off.",
       "export opens a local live dashboard for autoresearch.jsonl in your browser.",
 
@@ -1474,6 +1475,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "  /autoresearch draft-acceptance",
       "  /autoresearch acceptance",
       "  /autoresearch accept 4f2a9c1b",
+      "  /autoresearch continue",
       "  /autoresearch export",
     ].join("\n");
 
@@ -1555,11 +1557,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // Read max experiments from config file
     state.maxExperiments = readMaxExperiments(ctx.cwd);
 
-    // Auto-enter autoresearch mode only when a persisted experiment log exists
-    runtime.autoresearchMode = fs.existsSync(autoresearchJsonlPath(workDir));
-    if (runtime.autoresearchMode && runtime.acceptance.phase === "none") {
-      runtime.acceptance.phase = "awaiting_confirmation";
-    }
+    // Do not auto-enter autoresearch mode just because persisted state exists.
+    // The user must explicitly start or continue the loop with /autoresearch ...
+    runtime.autoresearchMode = false;
 
     updateWidget(ctx);
   };
@@ -3469,7 +3469,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         runtime.lastRunParsedMetrics = null;
         runtime.runningExperiment = null;
         cancelPendingResume(runtime);
-        clearAcceptanceState(ctx);
         stopDashboardServer();
         clearSessionUi(ctx);
         if (wasRunning) ctx.abort();
@@ -3524,6 +3523,42 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           return;
         }
         startInterview(goal);
+        return;
+      }
+
+      if (command === "continue" || command === "resume") {
+        if (runtime.autoresearchMode) {
+          ctx.ui.notify("Autoresearch already active", "info");
+          return;
+        }
+        const gateMessage = acceptanceGateMessage(ctx, "continue");
+        if (gateMessage) {
+          ctx.ui.notify(gateMessage, "error");
+          return;
+        }
+
+        runtime.autoresearchMode = true;
+        runtime.autoResumeTurns = 0;
+        cancelPendingResume(runtime);
+        updateWidget(ctx);
+
+        const workDir = resolveWorkDir(ctx.cwd);
+        const state = runtime.state;
+        const activationSteer = await fireHook({
+          event: "before",
+          cwd: workDir,
+          next_run: state.results.length + 1,
+          last_run: readLastRun(workDir),
+          session: buildSessionSnapshot(state),
+        });
+        sendWhenReady(ctx, [
+          activationSteer ?? "",
+          "Continue the confirmed autoresearch loop now.",
+          "Use persisted state from autoresearch.md, autoresearch.jsonl, and autoresearch.ideas.md as needed.",
+          "If autoresearch.jsonl already has a config header, do not call init_experiment again; otherwise initialize and run the baseline.",
+          "Proceed with run_experiment + log_experiment until autoresearch.acceptance.sh passes, maxIterations is reached, or the user interrupts.",
+          BENCHMARK_GUARDRAIL,
+        ].filter(Boolean).join("\n\n"));
         return;
       }
 
