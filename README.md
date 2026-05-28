@@ -63,8 +63,8 @@ pi install npm:pi-autoresearch
 
 | Shortcut     | Description |
 |--------------|-------------|
-| `Ctrl+Shift+T` | Toggle dashboard expand/collapse (inline widget ↔ full results table above the editor) |
-| `Ctrl+Shift+F` | Open fullscreen scrollable dashboard overlay. Navigate with `↑`/`↓`/`j`/`k`, `PageUp`/`PageDown`/`u`/`d`, `g`/`G` for top/bottom, `Escape` or `q` to close. |
+| `Ctrl+Shift+T` | Toggle dashboard expand/collapse while autoresearch mode is active (inline widget ↔ full results table above the editor) |
+| `Ctrl+Shift+F` | Open fullscreen scrollable dashboard overlay while autoresearch mode is active. Navigate with `↑`/`↓`/`j`/`k`, `PageUp`/`PageDown`/`u`/`d`, `g`/`G` for top/bottom, `Escape` or `q` to close. |
 
 To avoid conflicts with other pi extensions, override or disable these shortcuts in
 `<agent-dir>/extensions/pi-autoresearch.json`. `<agent-dir>` is the active pi profile
@@ -83,10 +83,10 @@ Use `null` to skip registering a shortcut. Omitted shortcuts keep their defaults
 
 ### UI
 
-- **Status widget** — always visible above the editor: `🔬 autoresearch 12 runs 8 kept │ ★ total_µs: 15,200 (-12.3%) │ conf: 2.1×`
+- **Status widget** — visible above the editor only while autoresearch mode is active: `🔬 autoresearch 12 runs 8 kept │ ★ total_µs: 15,200 (-12.3%) │ conf: 2.1×`
 - **Confidence score** — after 3+ runs, shows how the best improvement compares to the session noise floor. ≥2.0× (green) = likely real, 1.0–2.0× (yellow) = above noise but marginal, <1.0× (red) = within noise.
-- **Expanded dashboard** — `Ctrl+Shift+T` expands the widget into a full results table with columns for commit, metric, status, and description.
-- **Fullscreen overlay** — `Ctrl+Shift+F` opens a scrollable full-terminal dashboard. Shows a live spinner with elapsed time for running experiments.
+- **Expanded dashboard** — `Ctrl+Shift+T` expands the active widget into a full results table with columns for commit, metric, status, and description.
+- **Fullscreen overlay** — `Ctrl+Shift+F` opens a scrollable full-terminal dashboard while autoresearch mode is active. Shows a live spinner with elapsed time for running experiments.
 
 ### Skills
 
@@ -156,9 +156,9 @@ The agent reads `autoresearch.jsonl`, groups kept experiments into logical chang
 
 ### 4. Monitor progress
 
-- **Widget** — always visible above the editor
-- **`Ctrl+Shift+T`** — expand/collapse the full results table inline (config key: `shortcuts.toggleDashboard`)
-- **`Ctrl+Shift+F`** — fullscreen scrollable dashboard overlay (config key: `shortcuts.fullscreenDashboard`)
+- **Widget** — visible above the editor only while autoresearch mode is active
+- **`Ctrl+Shift+T`** — expand/collapse the active full results table inline (config key: `shortcuts.toggleDashboard`)
+- **`Ctrl+Shift+F`** — fullscreen scrollable dashboard overlay while autoresearch mode is active (config key: `shortcuts.fullscreenDashboard`)
 - **`/autoresearch export`** — open a live browser dashboard with chart and share card
 - **`Escape`** — interrupt anytime and ask for a summary
 

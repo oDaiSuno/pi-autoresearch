@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- Restored experiment history no longer renders the inline dashboard/widget while autoresearch mode is off; the widget and dashboard shortcuts now require an explicit active mode so persisted runs do not look like an automatic restart.
+
 ## [1.4.0] - 2026-05-06
 
 ### Added

@@ -7,8 +7,8 @@
  * Provides:
  * - `run_experiment` tool — runs any command, times it, captures output, detects pass/fail
  * - `log_experiment` tool — records results with session-persisted state
- * - Status widget showing experiment count + best metric
- * - Configurable shortcuts to expand/collapse and fullscreen the dashboard
+ * - Status widget showing experiment count + best metric while autoresearch mode is active
+ * - Configurable shortcuts to expand/collapse and fullscreen the active dashboard
  * - Adds autoresearch guidance to the system prompt and points the agent at autoresearch.md
  * - Injects autoresearch.md into context on every turn via before_agent_start
  */
@@ -1570,6 +1570,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const runtime = getRuntime(ctx);
     const state = runtime.state;
 
+    // Restored experiment history is not the same as active autoresearch mode.
+    // Keep the persistent widget hidden unless the user explicitly enters or
+    // continues autoresearch mode; otherwise old runs make Pi look auto-started.
+    if (!runtime.autoresearchMode) {
+      ctx.ui.setWidget("autoresearch", undefined);
+      return;
+    }
+
     if (state.results.length === 0) {
       if (!runtime.runningExperiment) {
         if (!runtime.autoresearchMode || runtime.acceptance.phase === "none") {
@@ -3011,12 +3019,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       handler: async (ctx) => {
         const runtime = getRuntime(ctx);
         const state = runtime.state;
+        if (!runtime.autoresearchMode) {
+          ctx.ui.notify(
+            state.results.length > 0
+              ? "Autoresearch mode is off — run /autoresearch continue to resume and show the dashboard"
+              : "No active autoresearch session — run /autoresearch <goal> to get started",
+            "info",
+          );
+          return;
+        }
         if (state.results.length === 0) {
-          if (!runtime.autoresearchMode && !fs.existsSync(autoresearchMdPath(resolveWorkDir(ctx.cwd)))) {
-            ctx.ui.notify("No experiments yet — run /autoresearch to get started", "info");
-          } else {
-            ctx.ui.notify("No experiments yet", "info");
-          }
+          ctx.ui.notify("No experiments yet", "info");
           return;
         }
         runtime.dashboardExpanded = !runtime.dashboardExpanded;
@@ -3035,6 +3048,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       handler: async (ctx) => {
         const runtime = getRuntime(ctx);
         const state = runtime.state;
+        if (!runtime.autoresearchMode) {
+          ctx.ui.notify(
+            state.results.length > 0
+              ? "Autoresearch mode is off — run /autoresearch continue to resume before opening the live dashboard"
+              : "No active autoresearch session — run /autoresearch <goal> to get started",
+            "info",
+          );
+          return;
+        }
         if (state.results.length === 0) {
           ctx.ui.notify("No experiments yet", "info");
           return;
